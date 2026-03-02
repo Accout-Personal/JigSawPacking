@@ -9,7 +9,9 @@ import random
 from scipy.spatial import Voronoi
 import os,json
 from pathlib import Path
+import sys
 
+DEBUG = False
 try:
     import cplex
     CPLEX_AVAILABLE = True
@@ -17,6 +19,7 @@ except ImportError:
     CPLEX_AVAILABLE = False
     print("Warning: CPLEX not available. Install with 'pip install cplex'")
 
+CPLEX_AVAILABLE = False
 class GridJigsawGenerator:
     def __init__(self, width, height, step=1.0, min_distance=None, target_pieces=30, min_fusion=2, retry_until_success=False, max_retries=10,overgen_factor=0.5):
         self.width = width
@@ -29,11 +32,17 @@ class GridJigsawGenerator:
         self.max_retries = max_retries  # Maximum retry attempts
         
         # Calculate initial Voronoi pieces needed
-        self.initial_pieces = int(target_pieces * (min_fusion + overgen_factor))
+        if overgen_factor == 0:
+            self.initial_pieces = target_pieces
+            self.min_fusion = 1
+        else:
+            self.initial_pieces = int(target_pieces * (min_fusion + overgen_factor))
         
         self.seed_points = []
         self.generation_attempt = 0  # Track attempts
-    
+        
+        
+
     def quantize_point(self, point):
         """Snap point to grid"""
         x, y = point
@@ -45,9 +54,8 @@ class GridJigsawGenerator:
         best_points = []
         best_min_distance = 0
         
-        # Calculate theoretical maximum for k points
-        area = self.width * self.height * 0.8 * 0.8
-        max_possible_distance = np.sqrt(area / (k * np.pi)) * 1.5
+        # Calculate theoretical maximum for k points using hexagonal packing estimate
+        max_possible_distance = np.sqrt(self.width * self.height / k) * 0.9 #Full hex packing factor is ~1.07, reduced for randomness
         
         # If requested distance is too large, warn and reduce
         if self.min_distance > max_possible_distance:
@@ -109,7 +117,6 @@ class GridJigsawGenerator:
                     best_points = points[:]
                     best_min_distance = min_dist_in_config
                     
-                    # If we meet the constraint, we're done
                     if best_min_distance >= self.min_distance:
                         break
         
@@ -125,15 +132,7 @@ class GridJigsawGenerator:
         
         # Generate well-spaced points
         points = self.generate_well_spaced_points(k)
-        
-        if not points:
-            print("Failed to generate points! Using fallback.")
-            points = []
-            for _ in range(k):
-                x = random.uniform(0.05 * self.width, 0.95 * self.width)
-                y = random.uniform(0.05 * self.height, 0.95 * self.height)
-                points.append((x, y))
-        
+                
         # Store seed points for visualization
         self.seed_points = points[:]
         
@@ -348,7 +347,7 @@ class GridJigsawGenerator:
         # Add binary variables
         prob.variables.add(names=var_names, types=[prob.variables.type.binary] * len(var_names))
         
-        # Objective: minimize total edge cost (dummy - we just want feasibility)
+        # Objective: minimize total edge cost
         prob.objective.set_sense(prob.objective.sense.minimize)
         
         # Constraint 1: Each piece assigned to exactly one cluster
@@ -633,8 +632,8 @@ class GridJigsawGenerator:
 
             # Pick random pair from the best candidates
             i, j = random.choice(best_pairs)
-
-            print(f"Fusing pieces {i} (grade {fusion_grades[i]}) and {j} (grade {fusion_grades[j]}) -> grade {fusion_grades[i] + fusion_grades[j]}")
+            if DEBUG:
+                print(f"Fusing pieces {i} (grade {fusion_grades[i]}) and {j} (grade {fusion_grades[j]}) -> grade {fusion_grades[i] + fusion_grades[j]}")
 
             # Merge the pieces
             fused = self.merge_two_pieces(current_pieces[i], current_pieces[j])
@@ -663,10 +662,11 @@ class GridJigsawGenerator:
             fusion_grades = new_grades
 
             # Debug info
-            grade_distribution = {}
-            for grade in fusion_grades:
-                grade_distribution[grade] = grade_distribution.get(grade, 0) + 1
-            print(f"Current pieces: {len(current_pieces)}, Grade distribution: {dict(sorted(grade_distribution.items()))}")
+            if DEBUG:
+                grade_distribution = {}
+                for grade in fusion_grades:
+                    grade_distribution[grade] = grade_distribution.get(grade, 0) + 1
+                print(f"Current pieces: {len(current_pieces)}, Grade distribution: {dict(sorted(grade_distribution.items()))}")
 
         print(f"Final fusion grades: {sorted(fusion_grades)}")
         return current_pieces
@@ -746,69 +746,15 @@ class GridJigsawGenerator:
         
         return abs(area) / 2
     
-    def plot_puzzle(self, pieces, title="MIP-Based Packing instance generator", show_grid=False, show_centroids=True):
-        """Plot the jigsaw"""
-        fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-        
-        # Draw pieces
-        colors = cm.Set3(np.linspace(0, 1, len(pieces)))
-        for i, piece in enumerate(pieces):
-            if len(piece) >= 3:
-                polygon = Polygon(piece, closed=True, 
-                                facecolor=colors[i],
-                                edgecolor='black', linewidth=2, alpha=0.8)
-                ax.add_patch(polygon)
-        
-        # Show centroids (initial seed points)
-        if show_centroids and hasattr(self, 'seed_points'):
-            for i, (cx, cy) in enumerate(self.seed_points):
-                ax.plot(cx, cy, 'ko', markersize=3, markerfacecolor='red', 
-                       markeredgecolor='black', markeredgewidth=0.5, zorder=10)
-        
-        # Show grid
-        if show_grid:
-            for x in np.arange(0, self.width + self.step, self.step):
-                ax.axvline(x, color='gray', alpha=0.3, linewidth=0.5)
-            for y in np.arange(0, self.height + self.step, self.step):
-                ax.axhline(y, color='gray', alpha=0.3, linewidth=0.5)
-        
-        # Rectangle boundary
-        boundary = plt.Rectangle((0, 0), self.width, self.height, 
-                               fill=False, edgecolor='red', linewidth=3)
-        ax.add_patch(boundary)
-        
-        # Format
-        ax.set_xlim(-1, self.width + 1)
-        ax.set_ylim(-1, self.height + 1)
-        ax.set_aspect('equal')
-        
-        # Update title to include attempt info if retry was used
-        if hasattr(self, 'generation_attempt') and self.generation_attempt > 1:
-            title += f" (Attempt {self.generation_attempt})"
-        ax.set_title(title, fontsize=16, fontweight='bold')
-        
-        # Info
-        coverage = self.calculate_coverage(pieces)
-        info_text = f'Coverage: {coverage:.1f}%\nFinal pieces: {len(pieces)}'
-        info_text += f'\nInitial pieces: {self.initial_pieces}'
-        info_text += f'\nMin fusion: {self.min_fusion}'
-        if hasattr(self, 'generation_attempt') and self.generation_attempt > 0:
-            info_text += f'\nGeneration attempt: {self.generation_attempt}'
-        
-        ax.text(0.02, 0.98, info_text, 
-                transform=ax.transAxes, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-        
-        plt.tight_layout()
-        return fig, ax
 
 
-class JigsawPuzzleApp:
+class BrokenGlassGenerator:
     def __init__(self, root):
         self.root = root
-        self.root.title("Jigsaw Packing Generator")
+        self.root.title("Broken Glass Generator")
         self.root.geometry("1200x800")
-        
+        self.advanced_visible = False  # start collapsed
+
         # Parameters
         self.params = {
             'length': tk.DoubleVar(value=25.0),
@@ -819,6 +765,8 @@ class JigsawPuzzleApp:
             'overgen_factor': tk.DoubleVar(value=0.5),
             'length_board': tk.DoubleVar(value=30.0),
             'width_board': tk.DoubleVar(value=25.0),
+            'show_centroids': tk.BooleanVar(value=False),
+            'seed': tk.StringVar(value=None),
         }
         
         self.generator = None
@@ -849,31 +797,68 @@ class JigsawPuzzleApp:
         
         # Create matplotlib canvas
         self.create_matplotlib_canvas(right_frame)
+
+        self.root.after(0, self.bring_to_front)
+
     
+    def bring_to_front(self):
+        window = self.root
+        # Raise the window
+        window.lift()
+        # Make it topmost for a moment
+        window.attributes('-topmost', True)
+        # Then allow other windows to go on top again
+        window.after_idle(window.attributes, '-topmost', False)
+        # Try to grab focus
+        window.focus_force()
+        
+    
+    
+
     def create_parameter_controls(self, parent):
         """Create parameter control widgets"""
+        
+        
+        
         # Title
         title_label = ttk.Label(parent, text="Parameters", font=('Arial', 14, 'bold'))
         title_label.pack(pady=(0, 20))
         
+        
         # Parameter controls
-        self.create_slider_group(parent, "Packing Dimensions", [
-            ("Length:", 'length', 5, 50,1),
+        group_frame1 = self.create_slider_group(parent, "Strip Size", [
+            ("Board Heigth(H):", 'length_board', 5, 60,1),
+            ("Board Width(W):", 'width_board', 5, 50,1),
+        ])
+        slider_frame = ttk.Frame(group_frame1)
+        slider_frame.pack(fill=tk.X, pady=2)
+        
+
+        self.create_slider_group(parent, "Glass Size", [
+            ("Heigth:", 'length', 5, 50,1),
             ("Width:", 'width', 5, 40,1),
-            ("Step:", 'step', 0.1, 2.0,0.1),
+            ("Number of Polygons:", 'target_pieces', 5, 100,1)
         ])
         
-        self.create_slider_group(parent, "Generation Parameters", [
-            ("Target Pieces:", 'target_pieces', 5, 100,1),
+        self.advanced_button = ttk.Button(
+            parent,
+            text="Show Advanced Settings ▾",
+            command=self.toggle_advanced
+        )
+        self.advanced_button.pack(fill="x", padx=10, pady=(0, 5))
+        self.advanced_frame = ttk.Frame(parent, padding=10, relief="groove")
+        
+        self.create_slider_group(self.advanced_frame, "Generation Parameters", [
             ("Min Distance:", 'min_distance', 0.1, 5.0,0.1),
-            ("Overgen Factor:", 'overgen_factor', 0.1, 2.0,0.1),
+            ("Polygon Irregularity:", 'overgen_factor', 0, 2.0,0.1),
+            ("Grid Step:", 'step', 0.1, 2.0,0.1),
         ])
-        
-        self.create_slider_group(parent, "Board Dimensions", [
-            ("Board Length:", 'length_board', 5, 60,1),
-            ("Board Width:", 'width_board', 5, 50,1),
-        ])
-        
+        ttk.Label(self.advanced_frame, text="Seed", width=15).pack(side=tk.LEFT)
+        ttk.Entry(self.advanced_frame, textvariable=self.params['seed'], width=15).pack(side=tk.RIGHT)
+         # Label
+        tk.Label(self.advanced_frame, text="").pack(pady=5)
+        ttk.Checkbutton(self.advanced_frame, text="Show Centroids", variable=self.params['show_centroids']).pack(anchor=tk.W, pady=10)
+       
         # Validation status
         self.status_frame = ttk.LabelFrame(parent, text="Status", padding=10)
         self.status_frame.pack(fill=tk.X, pady=10)
@@ -896,6 +881,20 @@ class JigsawPuzzleApp:
         ttk.Button(button_frame, text="Save Instance", 
                   command=self.save_instance).pack(fill=tk.X, pady=2)
     
+
+    def toggle_advanced(self):
+        """Show or hide the advanced_frame."""
+        if self.advanced_visible:
+            # Hide it
+            self.advanced_frame.pack_forget()
+            self.advanced_button.config(text="Show Advanced Settings ▾")
+            self.advanced_visible = False
+        else:
+            # Show it
+            self.advanced_frame.pack(fill="x", padx=10, pady=(0, 10),after=self.advanced_button)
+            self.advanced_button.config(text="Hide Advanced Settings ▴")
+            self.advanced_visible = True
+
     def create_slider_group(self, parent, title, sliders):
         """Create a group of parameter sliders with editable value fields"""
         group_frame = ttk.LabelFrame(parent, text=title, padding=10)
@@ -918,7 +917,7 @@ class JigsawPuzzleApp:
             slider_frame.pack(fill=tk.X, pady=2)
             
             # Label
-            ttk.Label(slider_frame, text=label, width=15).pack(side=tk.LEFT)
+            ttk.Label(slider_frame, text=label, width=20).pack(side=tk.LEFT)
             
             # Slider
             if isinstance(self.params[param_key], tk.IntVar):
@@ -982,13 +981,14 @@ class JigsawPuzzleApp:
                         label.config(text=f"{self.params[param].get():.1f}")
                 
                 self.params[param_key].trace('w', lambda *args, update=update_display: update())
+        return group_frame
     
     def create_matplotlib_canvas(self, parent):
         """Create matplotlib canvas for puzzle display"""
         # Create figure with equal subplot heights - FIXED: added height_ratios
         self.fig, (self.ax_preview, self.ax_result) = plt.subplots(2, 1, figsize=(8, 10), 
                                                                    gridspec_kw={'height_ratios': [1, 1]})
-        self.fig.suptitle('Jigsaw Packing Generator', fontsize=14, fontweight='bold')
+        self.fig.suptitle(' ', fontsize=14, fontweight='bold')
 
         self.ax_result.set_aspect('equal')
         # FIXED: Proper spacing that doesn't cause title overlap
@@ -1025,6 +1025,7 @@ class JigsawPuzzleApp:
         target_pieces = self.params['target_pieces'].get()
         step = self.params['step'].get()
         
+
         # Check board constraints
         if length_board < length:
             errors.append(f"Board length ({length_board:.1f}) must be >= length ({length:.1f})")
@@ -1072,14 +1073,13 @@ class JigsawPuzzleApp:
         
         # Draw puzzle area
         puzzle_rect = plt.Rectangle((0, 0), length, width, 
-                                  fill=False, edgecolor='blue', linewidth=2, label='Puzzle Area')
+                                  fill=False, edgecolor='blue', linestyle='--',alpha=0.7,linewidth=2, label='Glass Area')
         self.ax_preview.add_patch(puzzle_rect)
         
         # Draw board area (if different)
         if length_board != length or width_board != width:
             board_rect = plt.Rectangle((0, 0), length_board, width_board, 
-                                     fill=False, edgecolor='red', linewidth=2, 
-                                     linestyle='--', alpha=0.7, label='Board Area')
+                                     fill=False, edgecolor='red', linewidth=2,label='Board Area')
             self.ax_preview.add_patch(board_rect)
         
         # Show grid (simplified - just major lines)
@@ -1107,12 +1107,12 @@ class JigsawPuzzleApp:
         self.ax_preview.set_aspect('equal')
         
         # Place legend outside the plot area (to the right)
-        self.ax_preview.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        self.ax_preview.legend(bbox_to_anchor=(0.09, 0.80),borderaxespad=0.0, borderpad=0.3,loc='upper left',bbox_transform=self.fig.transFigure, fontsize=8)
         
         # FIXED: Add info text in the space between plots (external to plot area)
-        info_text = f'Puzzle: {length:.0f}×{width:.0f}\n Board: {length_board:.0f}×{width_board:.0f}\nTarget: {target_pieces} pieces \n Grid: {step:.1f}'
-        self.preview_info_text = self.fig.text(0.2, 0.90, info_text, ha='center', va='center', fontsize=9,
-                                              bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+        info_text = f'Puzzle: {length:.0f}×{width:.0f}\nBoard: {length_board:.0f}×{width_board:.0f}\nTarget: {target_pieces} pieces \nGrid: {step:.1f}'
+        self.preview_info_text = self.fig.text(0.1, 0.90, info_text, ha='left', va='center', fontsize=9,
+                                              bbox=dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.8))
         
         # Only redraw if canvas exists
         if hasattr(self, 'canvas'):
@@ -1147,7 +1147,26 @@ class JigsawPuzzleApp:
         try:
             # Get parameters
             params = {key: var.get() for key, var in self.params.items()}
-            
+            seed_string = params['seed']
+            seed = None
+            print("Using seed:", seed_string)
+            if seed_string is not None and seed_string != '':
+                try:
+                    seed = int(seed_string)
+                except ValueError:
+                    try:
+                        print("trying seed string to ascii number conversion")
+                        Ascii_seed = ""
+                        for w in seed_string:
+                            Ascii_seed += str(ord(w))
+                        seed = int(Ascii_seed) % int(sys.maxsize)
+                        #seed = int(Ascii_seed)
+ 
+                        print("Converted seed string to integer:", seed)
+                    except ValueError:
+                        print("Invalid seed value, using random seed")
+                        seed = None
+            random.seed(seed)
             # Create generator
             self.generator = GridJigsawGenerator(
                 width=params['length'],
@@ -1196,6 +1215,7 @@ class JigsawPuzzleApp:
             self.generate_btn.config(state="normal", text="Generate Puzzle")
     
     def display_result(self):
+        show_centroids = self.params['show_centroids'].get()
         """Display the generated instance result"""
         if not self.puzzle_pieces or not self.generator:
             return
@@ -1216,7 +1236,7 @@ class JigsawPuzzleApp:
                 self.ax_result.add_patch(polygon)
         
         # Show centroids
-        if hasattr(self.generator, 'seed_points'):
+        if hasattr(self.generator, 'seed_points') and show_centroids:
             for cx, cy in self.generator.seed_points:
                 self.ax_result.plot(cx, cy, 'ko', markersize=3, markerfacecolor='red', 
                                   markeredgecolor='black', markeredgewidth=0.5, zorder=10)
@@ -1242,7 +1262,7 @@ class JigsawPuzzleApp:
             info_text += f'Attempt: {self.generator.generation_attempt}'
         
         # FIXED: Place info text in the bottom margin area (external to plot area)
-        self.result_info_text = self.fig.text(0.12, 0.40, info_text, ha='center', va='center', fontsize=9,
+        self.result_info_text = self.fig.text(0.1, 0.53, info_text, ha='left', va='center', fontsize=9,
                                              bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
         
         self.canvas.draw()
@@ -1356,7 +1376,7 @@ def main():
         print()
     
     root = tk.Tk()
-    app = JigsawPuzzleApp(root)
+    app = BrokenGlassGenerator(root)
     root.mainloop()
 
 
